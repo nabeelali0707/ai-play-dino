@@ -58,6 +58,17 @@ GAME_OVER_DARKNESS_THRESHOLD = 0.30  # fraction of "dark" pixels in region
 STEP_SLEEP = 0.05  # seconds -> ~20 steps/second
 
 # ---------------------------------------------------------------------------
+# Reward shaping (PRD 4.1: "+1 per surviving step ... or negative penalty on death")
+# ---------------------------------------------------------------------------
+REWARD_ALIVE = 1.0
+REWARD_DEATH = -10.0
+
+# Ignore done-detection during the first N steps of an episode; the game-over
+# text from the previous episode can still be on screen right after reset()
+# and a false positive here would corrupt the reward signal (PRD section 8).
+MIN_EPISODE_STEPS = 15
+
+# ---------------------------------------------------------------------------
 # Training (DQN per PRD 4.2)
 # ---------------------------------------------------------------------------
 LOG_DIR = "logs/"
