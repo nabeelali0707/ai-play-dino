@@ -1,0 +1,19 @@
+# Core RL
+stable-baselines3>=2.3.0,<3.0.0
+gymnasium>=0.29.0
+torch>=2.2.0
+
+# Vision / capture
+mss>=9.0.0
+opencv-python>=4.9.0
+pytesseract>=0.3.10
+Pillow>=10.0.0
+
+# Input simulation (Windows)
+pydirectinput>=1.0.4
+
+# Logging
+tensorboard>=2.16.0
+
+# Env testing utility
+stable-baselines3[tests]>=2.3.0

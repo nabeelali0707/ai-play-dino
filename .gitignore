@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Training artifacts (never commit multi-GB models / logs)
+train/
+logs/
+models/
+*.zip
+
+# Screen captures for debugging
+debug/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
