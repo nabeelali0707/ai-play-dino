@@ -14,14 +14,14 @@ drift is the #1 suspect.
 
 # Main game viewport inside the Chrome window (the playable area with the
 # dino, cacti and pterodactyls). Captured frames are cropped from here.
-GAME_REGION = {"left": 100, "top": 250, "width": 660, "height": 150}
+GAME_REGION = {"left": 8, "top": 207, "width": 784, "height": 196}
 
 # Small strip containing the "GAME OVER" text (used for done detection).
-GAME_OVER_REGION = {"left": 350, "top": 280, "width": 200, "height": 50}
+GAME_OVER_REGION = {"left": 243, "top": 259, "width": 313, "height": 52}
 
 # Fixed screen coordinate of the restart button in the game-over screen.
 # reset() clicks this point to start a new episode.
-RESTART_BUTTON = (400, 390)
+RESTART_BUTTON = (400, 321)
 
 # ---------------------------------------------------------------------------
 # Actions (index -> meaning), Discrete(3)
@@ -45,9 +45,13 @@ OBS_HEIGHT = 83
 # Done detection
 # ---------------------------------------------------------------------------
 # OCR is fragile (PRD 5: "most fragile component"). We OCR first, then fall
-# back to a pixel-darkness check. GAME_OVER_REGION is mostly light gray
-# background; when "GAME OVER" appears the mean darkness rises sharply.
-GAME_OVER_DARKNESS_THRESHOLD = 0.30  # fraction of "dark" pixels in region
+# back to a pixel-signature check. All thresholds are polarity-agnostic so
+# both Chrome light and dark themes work: "text pixels" are pixels far from
+# the strip's own background (measured as its median).
+GO_TEXT_FRACTION_THRESHOLD = 0.10  # min fraction of text-like px in strip
+GO_TEXT_DELTA = 60                 # |px - bg| >= this counts as text
+GO_STATIC_MAX_DIFF = 3.0           # mean |diff| vs previous strip; GAME OVER
+                                   # text is static, pterodactyls move
 
 # ---------------------------------------------------------------------------
 # Timing

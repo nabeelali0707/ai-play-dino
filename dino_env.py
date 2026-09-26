@@ -93,6 +93,7 @@ class DinoEnv(gym.Env):
         self._sct: Optional[mss.base.MSSBase] = None
         self._frame = np.zeros(self.observation_space.shape, dtype=np.uint8)
         self._steps_this_episode = 0
+        self._prev_go_gray: Optional[np.ndarray] = None  # static-frame check
 
     # ----------------------------------------------------------- screen I/O
     def _capture_screen(self) -> np.ndarray:
@@ -140,6 +141,7 @@ class DinoEnv(gym.Env):
         right after reset().
         """
         if self._steps_this_episode < config.MIN_EPISODE_STEPS:
+            self._prev_go_gray = None
             return False
 
         frame = self._capture_fn()
@@ -180,8 +182,15 @@ class DinoEnv(gym.Env):
         return any(token in text for token in ("GAM", "GAH", "CAH", "GAN"))
 
     def _detect_game_over_darkness(self, frame: np.ndarray) -> bool:
-        """Pixel fallback: the game-over strip is mostly light background;
-        when 'GAME OVER' renders, mean darkness rises above threshold."""
+        """Polarity-agnostic pixel fallback (works in light AND dark themes).
+
+        The game-over strip normally shows plain background. When the dino
+        crashes, large static "GAME OVER" text appears. Two conditions:
+          1. enough text-like pixels (far from the strip's own background,
+             measured as its median),
+          2. the strip is STATIC vs the previous capture (the text doesn't
+             move; a passing pterodactyl does).
+        """
         left, top, w, h = (
             self.game_over_region["left"] - self.game_region["left"],
             self.game_over_region["top"] - self.game_region["top"],
@@ -193,9 +202,20 @@ class DinoEnv(gym.Env):
             return False
         strip = frame[top:top + h, left:left + w]
 
-        gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
-        dark_frac = float(np.mean(gray < 100))  # text pixels are dark gray
-        return dark_frac > config.GAME_OVER_DARKNESS_THRESHOLD
+        gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY).astype(np.int16)
+        bg = float(np.median(gray))
+        text_frac = float(np.mean(np.abs(gray - bg) >= config.GO_TEXT_DELTA))
+        if text_frac < config.GO_TEXT_FRACTION_THRESHOLD:
+            self._prev_go_gray = None
+            return False
+
+        static = True
+        if self._prev_go_gray is not None and \
+                self._prev_go_gray.shape == gray.shape:
+            mean_diff = float(np.mean(np.abs(gray - self._prev_go_gray)))
+            static = mean_diff <= config.GO_STATIC_MAX_DIFF
+        self._prev_go_gray = gray
+        return static
 
     # ----------------------------------------------------------- gym API
     def step(self, action):
