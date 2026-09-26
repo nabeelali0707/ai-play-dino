@@ -1,5 +1,5 @@
 """
-DinoEnv — a Gymnasium environment for the Chrome offline Dino game.
+DinoEnv - a Gymnasium environment for the Chrome offline Dino game.
 
 The agent perceives the game exactly like a human: it only sees pixels from
 screen capture (mss) and can only act through key presses (pydirectinput).
@@ -10,12 +10,14 @@ Design notes
 * Capture / input backends are injectable so the environment can be smoke
   tested without a live screen (see test_env.py --mock).
 * Done detection is dual-method (PRD section 8): pytesseract OCR first, then
-  a pixel-darkness fallback, because OCR on the small game-over strip is
-  unreliable ("GAME" -> "GAHE").
+  a polarity-agnostic pixel fallback with a static-frame check, because OCR
+  on the small game-over strip is unreliable ("GAME" -> "GAHE").
+* All pixel thresholds are background-relative (median of the region), so
+  both Chrome light and dark themes work.
 """
 
 import time
-from typing import Any, Optional
+from typing import Optional
 
 import cv2
 import gymnasium as gym
@@ -30,15 +32,13 @@ import config
 
 def _default_tesseract_path() -> Optional[str]:
     """Return the Windows Tesseract path if present, else None."""
+    import os
     for p in (
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",
         r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
     ):
-        try:
-            if __import__("os").path.exists(p):
-                return p
-        except OSError:
-            continue
+        if os.path.exists(p):
+            return p
     return None
 
 
@@ -67,10 +67,9 @@ class DinoEnv(gym.Env):
     ):
         super().__init__()
 
-        cfg = config
-        self.game_region = dict(game_region or cfg.GAME_REGION)
-        self.game_over_region = dict(game_over_region or cfg.GAME_OVER_REGION)
-        self.restart_button = tuple(restart_button or cfg.RESTART_BUTTON)
+        self.game_region = dict(game_region or config.GAME_REGION)
+        self.game_over_region = dict(game_over_region or config.GAME_OVER_REGION)
+        self.restart_button = tuple(restart_button or config.RESTART_BUTTON)
         self.render_mode = render_mode
         self.use_ocr = use_ocr
 
@@ -80,10 +79,9 @@ class DinoEnv(gym.Env):
         self._key_fn = key_fn or self._press_key
 
         # -- gymnasium spaces (PRD 4.1) ------------------------------------
-        # observation: grayscale frame, channel-first (1, H, W)
         self.observation_space = spaces.Box(
             low=0, high=255,
-            shape=(1, cfg.OBS_HEIGHT, cfg.OBS_WIDTH),
+            shape=(1, config.OBS_HEIGHT, config.OBS_WIDTH),
             dtype=np.uint8,
         )
         # actions: 0 = jump (space), 1 = duck (down), 2 = no-op
@@ -96,7 +94,7 @@ class DinoEnv(gym.Env):
         self._prev_go_gray: Optional[np.ndarray] = None  # static-frame check
 
     # ----------------------------------------------------------- screen I/O
-    def _capture_screen(self) -> np.ndarray:
+    def _capture_screen(self) -> Optional[np.ndarray]:
         """Capture the game region -> BGR ndarray, or None on failure."""
         try:
             if self._sct is None:
@@ -104,8 +102,7 @@ class DinoEnv(gym.Env):
             shot = self._sct.grab(self.game_region)
         except Exception:
             return None
-        # mss gives BGRA; drop alpha, keep BGR for cv2
-        return np.array(shot)[:, :, :3]
+        return np.array(shot)[:, :, :3]  # mss gives BGRA; drop alpha
 
     @staticmethod
     def _click_screen(x: int, y: int) -> None:
@@ -133,8 +130,29 @@ class DinoEnv(gym.Env):
         self._frame = obs
         return obs
 
+    # ------------------------------------------------------- done detection
+    def _go_strip(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        """Crop the game-over strip out of a game-region frame, or None."""
+        left = self.game_over_region["left"] - self.game_region["left"]
+        top = self.game_over_region["top"] - self.game_region["top"]
+        w, h = self.game_over_region["width"], self.game_over_region["height"]
+        H, W = frame.shape[:2]
+        if not (0 <= left and 0 <= top and left + w <= W and top + h <= H):
+            return None  # mis-calibrated region
+        return frame[top:top + h, left:left + w]
+
+    @staticmethod
+    def _gray_i16(strip: np.ndarray) -> np.ndarray:
+        return cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY).astype(np.int16)
+
+    @staticmethod
+    def _text_fraction(gray_i16: np.ndarray) -> float:
+        """Fraction of text-like pixels (far from the strip's own bg median)."""
+        bg = float(np.median(gray_i16))
+        return float(np.mean(np.abs(gray_i16 - bg) >= config.GO_TEXT_DELTA))
+
     def get_done(self) -> bool:
-        """Dual done detection (PRD 4.1 / 8): OCR first, darkness fallback.
+        """Dual done detection (PRD 4.1 / 8): OCR first, pixel fallback.
 
         Suppressed for the first MIN_EPISODE_STEPS of an episode so the
         previous episode's game-over text cannot cause a false positive
@@ -147,93 +165,71 @@ class DinoEnv(gym.Env):
         frame = self._capture_fn()
         if frame is None:
             return False
-
-        if self.use_ocr:
-            if self._detect_game_over_ocr(frame):
-                return True
-        return self._detect_game_over_darkness(frame)
-
-    def _detect_game_over_ocr(self, frame: np.ndarray) -> bool:
-        """OCR the game-over strip; fuzzy 'GAM' match (OCR reads GAME as
-        GAHE / CAME etc., but the leading G-A-M is nearly always intact)."""
-        left, top, w, h = (
-            self.game_over_region["left"] - self.game_region["left"],
-            self.game_over_region["top"] - self.game_region["top"],
-            self.game_over_region["width"],
-            self.game_over_region["height"],
-        )
-        H, W = frame.shape[:2]
-        if not (0 <= left and 0 <= top and left + w <= W and top + h <= H):
-            return False  # mis-calibrated region: skip OCR, fall through
-        strip = frame[top:top + h, left:left + w]
-
-        strip = cv2.resize(strip, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-        gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
-
-        try:
-            text = pytesseract.image_to_string(
-                thresh, config="--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            ).upper()
-        except Exception:
-            return False  # tesseract missing / crashed -> darkness fallback
-
-        # fuzzy: OCR garbage-tolerant match on the G-A-M prefix
-        return any(token in text for token in ("GAM", "GAH", "CAH", "GAN"))
-
-    def _detect_game_over_darkness(self, frame: np.ndarray) -> bool:
-        """Polarity-agnostic pixel fallback (works in light AND dark themes).
-
-        The game-over strip normally shows plain background. When the dino
-        crashes, large static "GAME OVER" text appears. Two conditions:
-          1. enough text-like pixels (far from the strip's own background,
-             measured as its median),
-          2. the strip is STATIC vs the previous capture (the text doesn't
-             move; a passing pterodactyl does).
-        """
-        left, top, w, h = (
-            self.game_over_region["left"] - self.game_region["left"],
-            self.game_over_region["top"] - self.game_region["top"],
-            self.game_over_region["width"],
-            self.game_over_region["height"],
-        )
-        H, W = frame.shape[:2]
-        if not (0 <= left and 0 <= top and left + w <= W and top + h <= H):
+        strip = self._go_strip(frame)
+        if strip is None:
             return False
-        strip = frame[top:top + h, left:left + w]
 
-        gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY).astype(np.int16)
-        bg = float(np.median(gray))
-        text_frac = float(np.mean(np.abs(gray - bg) >= config.GO_TEXT_DELTA))
-        if text_frac < config.GO_TEXT_FRACTION_THRESHOLD:
+        gray = self._gray_i16(strip)
+
+        # Fast path: plain background -> nothing to detect. This also makes
+        # the static-frame check self-consistent (we only compare frames
+        # that contain something text-like).
+        if self._text_fraction(gray) < config.GO_TEXT_FRACTION_THRESHOLD:
             self._prev_go_gray = None
             return False
 
+        if self.use_ocr and self._detect_game_over_ocr(strip):
+            return True
+        return self._detect_game_over_static(gray)
+
+    def _detect_game_over_ocr(self, strip: np.ndarray) -> bool:
+        """OCR the strip; fuzzy G-A-M prefix match (OCR reads GAME as GAHE,
+        CAME, GAN... but the leading G-A-M is nearly always intact)."""
+        big = cv2.resize(strip, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+        # Polarity-safe binarization (dark mode renders LIGHT text on dark):
+        _, thresh = cv2.threshold(gray, 0, 255,
+                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if float(np.mean(thresh)) > 127:  # mostly white -> make text dark
+            thresh = cv2.bitwise_not(thresh)
+
+        try:
+            text = pytesseract.image_to_string(
+                thresh,
+                config="--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            ).upper()
+        except Exception:
+            return False  # tesseract missing / crashed -> pixel fallback
+
+        return any(token in text for token in ("GAM", "GAH", "CAH", "GAN"))
+
+    def _detect_game_over_static(self, gray_i16: np.ndarray) -> bool:
+        """Polarity-agnostic pixel fallback.
+
+        "GAME OVER" text is large AND static; a passing pterodactyl is
+        text-like but moving. Require the strip to be unchanged vs the
+        previous text-like capture.
+        """
         static = True
         if self._prev_go_gray is not None and \
-                self._prev_go_gray.shape == gray.shape:
-            mean_diff = float(np.mean(np.abs(gray - self._prev_go_gray)))
+                self._prev_go_gray.shape == gray_i16.shape:
+            mean_diff = float(np.mean(np.abs(gray_i16 - self._prev_go_gray)))
             static = mean_diff <= config.GO_STATIC_MAX_DIFF
-        self._prev_go_gray = gray
+        self._prev_go_gray = gray_i16
         return static
 
     # ----------------------------------------------------------- gym API
     def step(self, action):
         """Send key -> capture -> check done -> reward (PRD 4.1)."""
-        # 1. act
         key = config.KEY_MAP.get(int(action))
         self._key_fn(key)
 
-        # 2. let the game react, then observe
         time.sleep(config.STEP_SLEEP)
         obs = self.get_observation()
         self._steps_this_episode += 1
 
-        # 3. episode end?
         terminated = bool(self.get_done())
         truncated = False
-
-        # 4. reward: survive = +1, die = penalty (PRD 4.1)
         reward = config.REWARD_ALIVE if not terminated else config.REWARD_DEATH
 
         info = {"steps": self._steps_this_episode}
@@ -245,9 +241,9 @@ class DinoEnv(gym.Env):
 
         self._click_fn(*self.restart_button)
         time.sleep(0.5)  # let the game restart and the dino respawn
-        # one no-op so the very first frame is a live game frame
         obs = self.get_observation()
         self._steps_this_episode = 0
+        self._prev_go_gray = None
 
         info = {"steps": 0}
         return obs, info
